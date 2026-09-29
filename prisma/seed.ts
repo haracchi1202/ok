@@ -4,7 +4,9 @@
 import "dotenv/config";
 import { PrismaClient } from "@prisma/client";
 import bcrypt from "bcryptjs";
-import { rm } from "fs/promises";
+import { readFile, rm } from "fs/promises";
+import { existsSync } from "fs";
+import sharp from "sharp";
 import { portraitSvg, sceneSvg } from "./seed-images";
 import { saveImageBuffer, IMAGE_PRESETS, UPLOAD_ROOT } from "../src/lib/storage";
 import { addDays, businessDateTime, todayBusinessDate, toJstDateString } from "../src/lib/time";
@@ -111,6 +113,21 @@ const ANSWERS: Record<string, string[]> = {
   おすすめポイント: ["初めての方にも丁寧にご説明します", "時間を忘れるくらいゆったり過ごせます", "手の温かさには自信があります", "会話のテンポを合わせるのが得意です"],
 };
 
+export const CAST_PHOTO = "prisma/seed-assets/cast.jpg";
+
+/** キャスト写真を 3:4 (顔が中心) に切り出して保存。全セラピストで同じファイルを共有する */
+export async function loadCastPhoto() {
+  if (!existsSync(CAST_PHOTO)) return null;
+  const src = sharp(await readFile(CAST_PHOTO)).rotate();
+  const { width = 0, height = 0 } = await src.metadata();
+  const w = Math.round(Math.min(width, (height * 3) / 4) * 0.75);
+  const h = Math.round((w * 4) / 3);
+  const left = Math.max(0, Math.min(width - w, Math.round(width * 0.25)));
+  const top = Math.max(0, Math.min(height - h, Math.round(height * 0.05)));
+  const buf = await src.extract({ left, top, width: w, height: h }).toBuffer();
+  return saveImageBuffer(buf, "therapists", IMAGE_PRESETS.therapist);
+}
+
 async function main() {
   console.log("Resetting data...");
   await rm(UPLOAD_ROOT, { recursive: true, force: true });
@@ -178,8 +195,9 @@ async function main() {
     ],
   });
 
-  // セラピスト
+  // キャスト写真 (prisma/seed-assets/cast.jpg があれば全員のメイン写真に使用。無ければシルエット画像のみ)
   console.log("Generating therapist images...");
+  const castPhoto = await loadCastPhoto();
   const therapists = [];
   for (const [i, t] of THERAPISTS.entries()) {
     const joinedAt = t.newcomer ? new Date(now.getTime() - (5 + i * 2) * 86400000) : new Date(now.getTime() - (120 + i * 40) * 86400000);
@@ -209,10 +227,12 @@ async function main() {
         },
       },
     });
-    const count = 3 + (i % 2);
+    if (castPhoto) await prisma.therapistImage.create({ data: { therapistId: th.id, ...castPhoto, alt: `${t.name}の写真`, sortOrder: 0 } });
+    const offset = castPhoto ? 1 : 0;
+    const count = castPhoto ? 2 : 3 + (i % 2);
     for (let v = 0; v < count; v++) {
       const img = await svgToImage(portraitSvg(i + 1, v), "therapists", "therapist");
-      await prisma.therapistImage.create({ data: { therapistId: th.id, ...img, alt: `${t.name}のイメージ写真${v + 1}`, sortOrder: v } });
+      await prisma.therapistImage.create({ data: { therapistId: th.id, ...img, alt: `${t.name}のイメージ写真${v + 1}`, sortOrder: v + offset } });
     }
     therapists.push(th);
   }
@@ -517,7 +537,7 @@ async function main() {
   console.log("Seed completed.");
 }
 
-main()
+if (process.argv[1]?.endsWith("seed.ts")) main()
   .catch((e) => {
     console.error(e);
     process.exit(1);
