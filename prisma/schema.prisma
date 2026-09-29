@@ -1,0 +1,518 @@
+// LUEUR セラピスト予約ポータル データモデル
+//
+// - 開発は SQLite、本番は provider を postgresql 等に変更して利用可能
+// - 列挙値は DB 非依存にするため String で保持し、src/lib/constants.ts で型定義している
+// - 日時は UTC の DateTime で保存し、表示時に Asia/Tokyo へ変換する
+// - 出勤の「営業日」は Schedule.date (YYYY-MM-DD) で持ち、開始/終了は実日時で保持するため
+//   日付をまたぐ勤務 (例: 20:00〜翌4:00) をそのまま表現できる
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// ───────────────────────── セラピスト ─────────────────────────
+
+model Therapist {
+  id             String   @id @default(cuid())
+  slug           String   @unique
+  name           String
+  nameKana       String // 頭文字検索用 (ひらがな)
+  age            Int
+  height         Int
+  catchCopy      String   @default("")
+  shopComment    String   @default("") // 店舗からの紹介文
+  selfMessage    String   @default("") // 本人からのメッセージ
+  status         String   @default("ACTIVE") // ACTIVE | HIDDEN | RETIRED
+  isNewcomer     Boolean  @default(false)
+  joinedAt       DateTime @default(now())
+  canOvernight   Boolean  @default(false) // 宿泊対応
+  nominationFee  Int? // 個別指名料 (null の場合は料金マスターの値)
+  recommendOrder Int      @default(100) // おすすめ順 (小さいほど上位)
+  popularityScore Int     @default(0) // ランキング未設定時の人気順フォールバック
+  repeatScore    Int      @default(0)
+  videoUrl       String?
+  snsX           String?
+  snsInstagram   String?
+  snsTiktok      String?
+  currentAreaId  String?
+  currentArea    Area?    @relation(fields: [currentAreaId], references: [id], onDelete: SetNull)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  images         TherapistImage[]
+  tags           TherapistTag[]
+  answers        ProfileAnswer[]
+  schedules      Schedule[]
+  availabilities Availability[]
+  reservations1  Reservation[]    @relation("FirstChoice")
+  reservations2  Reservation[]    @relation("SecondChoice")
+  reviews        Review[]
+  diaries        Diary[]
+  rankingEntries RankingEntry[]
+  events         EventTherapist[]
+  users          AdminUser[]
+
+  @@index([status, recommendOrder])
+  @@index([isNewcomer])
+  @@index([nameKana])
+}
+
+model TherapistImage {
+  id          String    @id @default(cuid())
+  therapistId String
+  therapist   Therapist @relation(fields: [therapistId], references: [id], onDelete: Cascade)
+  path        String // 大サイズ (プロフィール用)
+  thumbPath   String // サムネイル (一覧用)
+  width       Int       @default(900)
+  height      Int       @default(1200)
+  alt         String    @default("")
+  sortOrder   Int       @default(0) // 0 がメイン写真
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@index([therapistId, sortOrder])
+}
+
+model Tag {
+  id        String         @id @default(cuid())
+  name      String
+  slug      String         @unique
+  group     String         @default("FEATURE") // FEATURE(特徴) | SERVICE(対応サービス) | STYLE(雰囲気)
+  sortOrder Int            @default(100)
+  isActive  Boolean        @default(true)
+  createdAt DateTime       @default(now())
+  updatedAt DateTime       @updatedAt
+  therapists TherapistTag[]
+
+  @@index([group, sortOrder])
+}
+
+model TherapistTag {
+  therapistId String
+  tagId       String
+  therapist   Therapist @relation(fields: [therapistId], references: [id], onDelete: Cascade)
+  tag         Tag       @relation(fields: [tagId], references: [id], onDelete: Cascade)
+  createdAt   DateTime  @default(now())
+
+  @@id([therapistId, tagId])
+  @@index([tagId])
+}
+
+// プロフィール質問 (管理画面から自由に追加)
+model ProfileQuestion {
+  id        String          @id @default(cuid())
+  question  String
+  sortOrder Int             @default(100)
+  isActive  Boolean         @default(true)
+  createdAt DateTime        @default(now())
+  updatedAt DateTime        @updatedAt
+  answers   ProfileAnswer[]
+}
+
+model ProfileAnswer {
+  id          String          @id @default(cuid())
+  therapistId String
+  questionId  String
+  answer      String
+  therapist   Therapist       @relation(fields: [therapistId], references: [id], onDelete: Cascade)
+  question    ProfileQuestion @relation(fields: [questionId], references: [id], onDelete: Cascade)
+  createdAt   DateTime        @default(now())
+  updatedAt   DateTime        @updatedAt
+
+  @@unique([therapistId, questionId])
+}
+
+// ───────────────────────── 出勤・予約枠 ─────────────────────────
+
+model Schedule {
+  id          String         @id @default(cuid())
+  therapistId String
+  therapist   Therapist      @relation(fields: [therapistId], references: [id], onDelete: Cascade)
+  date        String // 営業日 YYYY-MM-DD (JST)
+  startAt     DateTime
+  endAt       DateTime // 日付またぎ可 (startAt < endAt)
+  status      String         @default("WORKING") // WORKING | OFF | TBD
+  note        String         @default("")
+  createdAt   DateTime       @default(now())
+  updatedAt   DateTime       @updatedAt
+  slots       Availability[]
+
+  @@unique([therapistId, date])
+  @@index([date, status])
+  @@index([startAt, endAt])
+}
+
+model Availability {
+  id          String    @id @default(cuid())
+  scheduleId  String
+  therapistId String
+  schedule    Schedule  @relation(fields: [scheduleId], references: [id], onDelete: Cascade)
+  therapist   Therapist @relation(fields: [therapistId], references: [id], onDelete: Cascade)
+  startAt     DateTime
+  endAt       DateTime
+  status      String    @default("AVAILABLE") // AVAILABLE | BOOKED | INQUIRY | CLOSED
+  reservationId String?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@unique([therapistId, startAt])
+  @@index([scheduleId])
+  @@index([startAt, status])
+}
+
+// ───────────────────────── 料金マスター ─────────────────────────
+
+model Course {
+  id          String   @id @default(cuid())
+  name        String
+  minutes     Int
+  price       Int
+  description String   @default("")
+  isOvernight Boolean  @default(false)
+  sortOrder   Int      @default(100)
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  reservations Reservation[]
+}
+
+model Option {
+  id          String   @id @default(cuid())
+  name        String
+  price       Int
+  description String   @default("")
+  sortOrder   Int      @default(100)
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+model Area {
+  id           String      @id @default(cuid())
+  name         String
+  slug         String      @unique
+  transportFee Int         @default(0)
+  note         String      @default("")
+  sortOrder    Int         @default(100)
+  isActive     Boolean     @default(true)
+  createdAt    DateTime    @default(now())
+  updatedAt    DateTime    @updatedAt
+  therapists   Therapist[]
+  reservations Reservation[]
+}
+
+// 指名料・延長料・深夜料金など、キー単位の料金ルール
+model PriceRule {
+  id        String   @id @default(cuid())
+  key       String   @unique // nomination_first | nomination_repeat | extension_30 | late_night_fee | late_night_start | late_night_end ...
+  label     String
+  amount    Int
+  note      String   @default("")
+  sortOrder Int      @default(100)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Campaign {
+  id           String    @id @default(cuid())
+  name         String
+  description  String    @default("")
+  discountType String    @default("AMOUNT") // AMOUNT | PERCENT
+  value        Int
+  target       String    @default("ALL") // ALL | FIRST | REPEAT
+  minCourseMinutes Int   @default(0)
+  startsAt     DateTime?
+  endsAt       DateTime?
+  isActive     Boolean   @default(true)
+  sortOrder    Int       @default(100)
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+}
+
+// ───────────────────────── 予約 ─────────────────────────
+
+model Reservation {
+  id               String     @id @default(cuid())
+  reservationNo    String     @unique
+  accessToken      String // 受付完了画面の閲覧用トークン
+  status           String     @default("PENDING") // PENDING(仮受付) | REVIEWING(確認中) | CONFIRMED(確定) | COMPLETED(完了) | CANCELLED
+  desiredDate      String // YYYY-MM-DD
+  desiredTime      String // HH:MM
+  startAt          DateTime
+  therapistId      String?
+  therapist        Therapist? @relation("FirstChoice", fields: [therapistId], references: [id], onDelete: SetNull)
+  secondTherapistId String?
+  secondTherapist  Therapist? @relation("SecondChoice", fields: [secondTherapistId], references: [id], onDelete: SetNull)
+  isRepeat         Boolean    @default(false)
+  customerName     String
+  phone            String
+  email            String
+  areaId           String?
+  area             Area?      @relation(fields: [areaId], references: [id], onDelete: SetNull)
+  nearestStation   String     @default("")
+  meetingMethod    String     @default("") // 待ち合わせ | 直接訪問 など
+  place            String     @default("") // 自宅 | ホテル など
+  courseId         String?
+  course           Course?    @relation(fields: [courseId], references: [id], onDelete: SetNull)
+  extensionCount   Int        @default(0)
+  optionIds        String     @default("[]") // JSON 配列
+  campaignId       String?
+  paymentMethod    String     @default("")
+  note             String     @default("")
+  estimatedTotal   Int        @default(0)
+  priceBreakdown   String     @default("{}") // JSON
+  adminMemo        String     @default("")
+  ipHash           String     @default("")
+  createdAt        DateTime   @default(now())
+  updatedAt        DateTime   @updatedAt
+
+  @@index([status, desiredDate])
+  @@index([therapistId, desiredDate])
+  @@index([createdAt])
+}
+
+model Inquiry {
+  id        String   @id @default(cuid())
+  name      String
+  email     String
+  phone     String   @default("")
+  category  String   @default("GENERAL")
+  message   String
+  status    String   @default("NEW") // NEW | IN_PROGRESS | DONE
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status, createdAt])
+}
+
+// ───────────────────────── 口コミ・日記・ランキング ─────────────────────────
+
+model Review {
+  id          String    @id @default(cuid())
+  therapistId String
+  therapist   Therapist @relation(fields: [therapistId], references: [id], onDelete: Cascade)
+  nickname    String
+  visitDate   String // YYYY-MM-DD
+  rating      Int // 1-5
+  title       String
+  body        String
+  tags        String    @default("") // カンマ区切り
+  status      String    @default("PENDING") // PENDING | PUBLISHED | HIDDEN
+  shopReply   String    @default("")
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@index([therapistId, status, createdAt])
+  @@index([status, createdAt])
+}
+
+model Diary {
+  id          String    @id @default(cuid())
+  slug        String    @unique
+  therapistId String
+  therapist   Therapist @relation(fields: [therapistId], references: [id], onDelete: Cascade)
+  title       String
+  body        String
+  imagePath   String?
+  thumbPath   String?
+  status      String    @default("DRAFT") // DRAFT | PUBLISHED
+  publishedAt DateTime  @default(now()) // 未来日時にすると予約公開
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@index([status, publishedAt])
+  @@index([therapistId, status, publishedAt])
+}
+
+model Ranking {
+  id          String         @id @default(cuid())
+  type        String // POPULAR | REPEAT | NEWCOMER | SUPPORT
+  period      String // DAILY | WEEKLY | MONTHLY
+  periodStart String // YYYY-MM-DD
+  title       String         @default("")
+  source      String         @default("MANUAL") // MANUAL | AUTO
+  isPublished Boolean        @default(true)
+  createdAt   DateTime       @default(now())
+  updatedAt   DateTime       @updatedAt
+  entries     RankingEntry[]
+
+  @@unique([type, period, periodStart])
+  @@index([type, period, isPublished])
+}
+
+model RankingEntry {
+  id           String    @id @default(cuid())
+  rankingId    String
+  therapistId  String
+  rank         Int
+  score        Int       @default(0)
+  previousRank Int? // null = 前回圏外 (NEW 表示)
+  ranking      Ranking   @relation(fields: [rankingId], references: [id], onDelete: Cascade)
+  therapist    Therapist @relation(fields: [therapistId], references: [id], onDelete: Cascade)
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  @@unique([rankingId, therapistId])
+  @@index([rankingId, rank])
+}
+
+// ───────────────────────── コンテンツ ─────────────────────────
+
+model Event {
+  id          String           @id @default(cuid())
+  slug        String           @unique
+  title       String
+  summary     String           @default("")
+  body        String           @default("")
+  imagePath   String?
+  startsAt    DateTime?
+  endsAt      DateTime?
+  isPublished Boolean          @default(true)
+  sortOrder   Int              @default(100)
+  createdAt   DateTime         @default(now())
+  updatedAt   DateTime         @updatedAt
+  therapists  EventTherapist[]
+
+  @@index([isPublished, startsAt])
+}
+
+model EventTherapist {
+  eventId     String
+  therapistId String
+  event       Event     @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  therapist   Therapist @relation(fields: [therapistId], references: [id], onDelete: Cascade)
+
+  @@id([eventId, therapistId])
+}
+
+model News {
+  id          String   @id @default(cuid())
+  slug        String   @unique
+  title       String
+  body        String   @default("")
+  category    String   @default("NEWS") // NEWS | IMPORTANT | TOPICS
+  isImportant Boolean  @default(false)
+  isPublished Boolean  @default(true)
+  publishedAt DateTime @default(now())
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([isPublished, publishedAt])
+}
+
+// 動画・特集コンテンツ
+model Feature {
+  id          String   @id @default(cuid())
+  slug        String   @unique
+  title       String
+  summary     String   @default("")
+  body        String   @default("")
+  kind        String   @default("ARTICLE") // ARTICLE | VIDEO
+  videoUrl    String?
+  imagePath   String?
+  therapistSlugs String @default("") // 関連セラピスト (カンマ区切り slug)
+  isPublished Boolean  @default(true)
+  publishedAt DateTime @default(now())
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([isPublished, publishedAt])
+}
+
+model Faq {
+  id        String   @id @default(cuid())
+  category  String   @default("一般")
+  question  String
+  answer    String
+  sortOrder Int      @default(100)
+  isPublished Boolean @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([isPublished, sortOrder])
+}
+
+model Banner {
+  id        String    @id @default(cuid())
+  title     String
+  subtitle  String    @default("")
+  imagePath String?
+  linkUrl   String    @default("")
+  position  String    @default("HOME_MAIN") // HOME_MAIN | HOME_SUB
+  startsAt  DateTime?
+  endsAt    DateTime?
+  isActive  Boolean   @default(true)
+  sortOrder Int       @default(100)
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  @@index([position, isActive, sortOrder])
+}
+
+// 固定ページ (初めての方へ / 利用規約 / プライバシーポリシー / キャンセルポリシー / 法定表記 など)
+model Page {
+  id          String   @id @default(cuid())
+  slug        String   @unique
+  title       String
+  body        String   @default("")
+  seoDescription String @default("")
+  isPublished Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+// ───────────────────────── 管理・設定 ─────────────────────────
+
+model AdminUser {
+  id           String     @id @default(cuid())
+  email        String     @unique
+  name         String
+  passwordHash String
+  role         String     @default("STAFF") // ADMIN | STAFF | THERAPIST
+  therapistId  String? // role=THERAPIST のとき紐づくセラピスト
+  therapist    Therapist? @relation(fields: [therapistId], references: [id], onDelete: SetNull)
+  isActive     Boolean    @default(true)
+  lastLoginAt  DateTime?
+  createdAt    DateTime   @default(now())
+  updatedAt    DateTime   @updatedAt
+  auditLogs    AuditLog[]
+}
+
+model SiteSetting {
+  key       String   @id
+  value     String
+  updatedAt DateTime @updatedAt
+}
+
+model AuditLog {
+  id        String     @id @default(cuid())
+  actorId   String?
+  actor     AdminUser? @relation(fields: [actorId], references: [id], onDelete: SetNull)
+  action    String // create | update | delete | login | status ...
+  entity    String
+  entityId  String     @default("")
+  detail    String     @default("")
+  ip        String     @default("")
+  createdAt DateTime   @default(now())
+
+  @@index([entity, createdAt])
+  @@index([createdAt])
+}
+
+model MailLog {
+  id        String   @id @default(cuid())
+  to        String
+  subject   String
+  body      String
+  status    String   @default("LOGGED") // SENT | LOGGED | FAILED
+  error     String   @default("")
+  createdAt DateTime @default(now())
+
+  @@index([createdAt])
+}
